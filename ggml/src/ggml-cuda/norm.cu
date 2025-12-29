@@ -1,14 +1,14 @@
 #include "norm.cuh"
 
-template <int block_size>
-static __global__ void norm_f32(const float * x, float * dst, const int ncols, const float eps) {
+template <int block_size, typename T>
+static __global__ void norm_f32(const T * x, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
 
     float2 mean_var = make_float2(0.f, 0.f);
 
     for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[row*ncols + col];
+        const float xi = (float)x[row*ncols + col];
         mean_var.x += xi;
         mean_var.y += xi * xi;
     }
@@ -32,7 +32,43 @@ static __global__ void norm_f32(const float * x, float * dst, const int ncols, c
     const float inv_std = rsqrtf(var + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[row*ncols + col] = (x[row*ncols + col] - mean) * inv_std;
+        dst[row*ncols + col] = (T)(((float)x[row*ncols + col] - mean) * inv_std);
+    }
+}
+
+template <int block_size, typename T>
+static __global__ void fused_norm_f32(const T * x, const float * c, float * dst, const int ncols, const float eps) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    const int tid = threadIdx.x;
+
+    float2 mean_var = make_float2(0.f, 0.f);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = (float)x[row*ncols + col];
+        mean_var.x += xi;
+        mean_var.y += xi * xi;
+    }
+
+    // sum up partial sums
+    mean_var = warp_reduce_sum(mean_var);
+    if (block_size > WARP_SIZE) {
+        __shared__ float2 s_sum[32];
+        int warp_id = threadIdx.x / WARP_SIZE;
+        int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum[warp_id] = mean_var;
+        }
+        __syncthreads();
+        mean_var = s_sum[lane_id];
+        mean_var = warp_reduce_sum(mean_var);
+    }
+
+    const float mean = mean_var.x / ncols;
+    const float var = mean_var.y / ncols - mean * mean;
+    const float inv_std = rsqrtf(var + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[row*ncols + col] = (T)(((float)x[row*ncols + col] - mean) * inv_std * c[col]);
     }
 }
 
@@ -176,15 +212,15 @@ static __global__ void rms_norm_f32_nc(
     }
 }
 
-template <int block_size>
-static __global__ void fused_rms_norm_f32(const float * x, const float * y, float * dst, const int ncols, const float eps) {
+template <int block_size, typename src_t>
+static __global__ void fused_rms_norm_f32(const src_t * x, const float * y, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
 
     float tmp = 0.0f; // partial sum for thread in warp
 
     for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[row*ncols + col];
+        const float xi = (float)x[row*ncols + col];
         tmp += xi * xi;
     }
 
@@ -206,13 +242,13 @@ static __global__ void fused_rms_norm_f32(const float * x, const float * y, floa
     const float scale = rsqrtf(mean + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[row*ncols + col] = scale * y[col] * x[row*ncols + col];
+        dst[row*ncols + col] = scale * y[col] * (float)x[row*ncols + col];
     }
 }
 
-template <int block_size>
+template <int block_size, typename src_t>
 static __global__ void fused_rms_norm_f32_nc(
-        const float * x, const float * y, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
+        const src_t * x, const float * y, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
         const int64_t stride_sample, const float eps) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
@@ -229,7 +265,7 @@ static __global__ void fused_rms_norm_f32_nc(
     float tmp = 0.0f; // partial sum for thread in warp
 
     for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
+        const float xi = (float)x[col];
         tmp += xi * xi;
     }
 
@@ -257,18 +293,19 @@ static __global__ void fused_rms_norm_f32_nc(
     const float scale = rsqrtf(mean + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale * y[col] * x[col];
+        dst[col] = scale * y[col] * (float)x[col];
     }
 }
 
-static void norm_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+template <typename T>
+static void norm_f32_cuda(const T * x, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
     GGML_ASSERT(ncols % WARP_SIZE == 0);
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
-        norm_f32<WARP_SIZE><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
+        norm_f32<WARP_SIZE, T><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        norm_f32<1024><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
+        norm_f32<1024, T><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
     }
 }
 
@@ -307,32 +344,55 @@ static void rms_norm_f32_nc_cuda(
     }
 }
 
-static void fused_rms_norm_f32_cuda(const float * x, const float * y, float * dst,
-        const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+template <typename src_t>
+static void fused_rms_norm_f32_cuda(const src_t * x, const float * y, float * dst,
+        const int ncols, const int nrows, const float eps, bool is_norm, cudaStream_t stream) {
     constexpr int kBlockSize = 256;
     GGML_ASSERT(ncols % WARP_SIZE == 0);
-    if (ncols < kBlockSize) {
-        switch (ncols) {
-            case  32: fused_rms_norm_f32< 32><<<nrows,  32, 0, stream>>>(x, y, dst, ncols, eps); break;
-            case  64: fused_rms_norm_f32< 64><<<nrows,  64, 0, stream>>>(x, y, dst, ncols, eps); break;
-            case  96: fused_rms_norm_f32< 96><<<nrows,  96, 0, stream>>>(x, y, dst, ncols, eps); break;
-            case 128: fused_rms_norm_f32<128><<<nrows, 128, 0, stream>>>(x, y, dst, ncols, eps); break;
-            case 160: fused_rms_norm_f32<160><<<nrows, 160, 0, stream>>>(x, y, dst, ncols, eps); break;
-            case 192: fused_rms_norm_f32<192><<<nrows, 192, 0, stream>>>(x, y, dst, ncols, eps); break;
-            default : fused_rms_norm_f32<224><<<nrows, 224, 0, stream>>>(x, y, dst, ncols, eps); break;
+    if (is_norm) {
+        if (ncols < kBlockSize) {
+            switch (ncols) {
+                case  32: fused_norm_f32< 32><<<nrows,  32, 0, stream>>>(x, y, dst, ncols, eps); break;
+                case  64: fused_norm_f32< 64><<<nrows,  64, 0, stream>>>(x, y, dst, ncols, eps); break;
+                case  96: fused_norm_f32< 96><<<nrows,  96, 0, stream>>>(x, y, dst, ncols, eps); break;
+                case 128: fused_norm_f32<128><<<nrows, 128, 0, stream>>>(x, y, dst, ncols, eps); break;
+                case 160: fused_norm_f32<160><<<nrows, 160, 0, stream>>>(x, y, dst, ncols, eps); break;
+                case 192: fused_norm_f32<192><<<nrows, 192, 0, stream>>>(x, y, dst, ncols, eps); break;
+                default : fused_norm_f32<224><<<nrows, 224, 0, stream>>>(x, y, dst, ncols, eps); break;
+            }
         }
-    }
-    else if (ncols < 1024) {
-        const dim3 block_dims(kBlockSize, 1, 1);
-        fused_rms_norm_f32<kBlockSize><<<nrows, block_dims, 0, stream>>>(x, y, dst, ncols, eps);
+        else if (ncols < 1024) {
+            const dim3 block_dims(kBlockSize, 1, 1);
+            fused_norm_f32<kBlockSize><<<nrows, block_dims, 0, stream>>>(x, y, dst, ncols, eps);
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            fused_norm_f32<1024><<<nrows, block_dims, 0, stream>>>(x, y, dst, ncols, eps);
+        }
     } else {
-        const dim3 block_dims(1024, 1, 1);
-        fused_rms_norm_f32<1024><<<nrows, block_dims, 0, stream>>>(x, y, dst, ncols, eps);
+        if (ncols < kBlockSize) {
+            switch (ncols) {
+                case  32: fused_rms_norm_f32< 32><<<nrows,  32, 0, stream>>>(x, y, dst, ncols, eps); break;
+                case  64: fused_rms_norm_f32< 64><<<nrows,  64, 0, stream>>>(x, y, dst, ncols, eps); break;
+                case  96: fused_rms_norm_f32< 96><<<nrows,  96, 0, stream>>>(x, y, dst, ncols, eps); break;
+                case 128: fused_rms_norm_f32<128><<<nrows, 128, 0, stream>>>(x, y, dst, ncols, eps); break;
+                case 160: fused_rms_norm_f32<160><<<nrows, 160, 0, stream>>>(x, y, dst, ncols, eps); break;
+                case 192: fused_rms_norm_f32<192><<<nrows, 192, 0, stream>>>(x, y, dst, ncols, eps); break;
+                default : fused_rms_norm_f32<224><<<nrows, 224, 0, stream>>>(x, y, dst, ncols, eps); break;
+            }
+        }
+        else if (ncols < 1024) {
+            const dim3 block_dims(kBlockSize, 1, 1);
+            fused_rms_norm_f32<kBlockSize><<<nrows, block_dims, 0, stream>>>(x, y, dst, ncols, eps);
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            fused_rms_norm_f32<1024><<<nrows, block_dims, 0, stream>>>(x, y, dst, ncols, eps);
+        }
     }
 }
 
+template <typename src_t>
 static void fused_rms_norm_f32_nc_cuda(
-        const float * x, const float * y, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const src_t * x, const float * y, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (ncols < 1024) {
@@ -362,7 +422,7 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(ggml_is_contiguous(src0));
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
 
     const int64_t ne00 = src0->ne[0];
@@ -371,7 +431,11 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
 
-    norm_f32_cuda(src0_d, dst_d, ne00, nrows, eps, stream);
+    if (src0->type == GGML_TYPE_F32) {
+        norm_f32_cuda(src0_d, dst_d, ne00, nrows, eps, stream);
+    } else {
+        norm_f32_cuda((const half *)src0_d, dst_d, ne00, nrows, eps, stream);
+    }
 }
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -420,7 +484,7 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 }
 
-void ggml_cuda_op_fused_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_fused_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool is_norm) {
     if (!dst->src[1]) {
         ggml_cuda_op_rms_norm(ctx, dst);
         return;
@@ -432,7 +496,7 @@ void ggml_cuda_op_fused_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * 
     float * dst_d = (float *)dst->data;
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     GGML_ASSERT(src0->ne[0] == src1->ne[0]);
@@ -445,14 +509,25 @@ void ggml_cuda_op_fused_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (ggml_is_contiguous(src0)) {
         const int64_t nrows = ggml_nrows(src0);
-        fused_rms_norm_f32_cuda(src0_d, src1_d, dst_d, ne00, nrows, eps, stream);
+        if (src0->type == GGML_TYPE_F32) {
+            fused_rms_norm_f32_cuda(src0_d, src1_d, dst_d, ne00, nrows, eps, is_norm, stream);
+        } else {
+            fused_rms_norm_f32_cuda((const half *)src0_d, src1_d, dst_d, ne00, nrows, eps, is_norm, stream);
+        }
     } else {
+        if (is_norm) {
+            GGML_ABORT("Non-contiguous norm is not implemented");
+        }
         auto ts0 = ggml_type_size(src0->type);
         GGML_ASSERT(src0->nb[0] == ts0);
         auto s01 = src0->nb[1] / ts0;
         auto s02 = src0->nb[2] / ts0;
         auto s03 = src0->nb[3] / ts0;
-        fused_rms_norm_f32_nc_cuda(src0_d, src1_d, dst_d, ne00, src0->ne[1], src0->ne[2], src0->ne[3], s01, s02, s03, eps, stream);
+        if (src0->type == GGML_TYPE_F32) {
+            fused_rms_norm_f32_nc_cuda(src0_d, src1_d, dst_d, ne00, src0->ne[1], src0->ne[2], src0->ne[3], s01, s02, s03, eps, stream);
+        } else {
+            fused_rms_norm_f32_nc_cuda((const half *)src0_d, src1_d, dst_d, ne00, src0->ne[1], src0->ne[2], src0->ne[3], s01, s02, s03, eps, stream);
+        }
     }
 }
 

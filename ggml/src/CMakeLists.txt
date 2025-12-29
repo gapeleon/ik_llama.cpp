@@ -265,6 +265,7 @@ if (GGML_IQK_MUL_MAT)
                             iqk/iqk_flash_attn.cpp
                             iqk/fa/iqk_fa_576_512.cpp
                             iqk/fa/iqk_fa_192_128.cpp
+                            iqk/fa/iqk_fa_192_192.cpp
                             iqk/fa/iqk_fa_256_256.cpp
                             iqk/fa/iqk_fa_128_128.cpp
                             iqk/fa/iqk_fa_96_96.cpp
@@ -461,6 +462,21 @@ if (GGML_CUDA)
                 set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} CUDA::cuda_driver) # required by cuDeviceGetAttribute(), cuMemGetAllocationGranularity(...), ...
             endif()
         endif()
+
+        if (GGML_NCCL)
+            find_package(NCCL)
+            if (NCCL_FOUND)
+                message("==================== NCCL found!")
+                message("NCCL_LIBRARIES = ${NCCL_LIBRARIES}")
+                message("NCCL_INCLUDE_DIRS = ${NCCL_INCLUDE_DIRS}")
+                set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ${NCCL_LIBRARIES})
+                set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${NCCL_INCLUDE_DIRS})
+                add_compile_definitions(GGML_USE_NCCL)
+            else()
+                message("==================== NCCL NOT found -> building wihout NCCL support")
+            endif()
+        endif()
+
         if (NOT GGML_MUSA)
             set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
             set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_LIBRARIES 0)

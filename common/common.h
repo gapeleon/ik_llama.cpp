@@ -119,6 +119,15 @@ enum common_webui {
 
 common_webui common_webui_from_name(const std::string& format);
 
+struct thinking_tokens {
+    bool exclude = true;
+    std::string begin = "<think>";
+    std::string end = "</think>";
+};
+
+thinking_tokens thinking_tokens_from_string(const std::string& format);
+
+
 struct model_paths {
     std::string path        = ""; // model local path                                       // NOLINT
     std::string url         = ""; // model url to download                                  // NOLINT
@@ -154,6 +163,7 @@ struct gpt_params {
     int32_t n_gpu_layers          =    -1; // number of layers to store in VRAM (-1 - use default)
     int32_t n_gpu_layers_draft    =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
     int32_t main_gpu              =     0; // the GPU that is used for scratch and small tensors
+    int32_t max_gpu               =     0; // max number of GPUs to use at a time for split mode "graph"
     float   tensor_split[128]     =   {0}; // how split tensors should be distributed across GPUs
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
@@ -166,6 +176,7 @@ struct gpt_params {
     float   yarn_beta_slow        =  -1.0f; // YaRN high correction dim
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
     float   defrag_thold          = -1.0f; // KV cache defragmentation threshold
+    int32_t max_extra_alloc_MiB   = 256;   // additional VRAM per GPU the scheduler may allocate for more efficient compute graph evaluation
 
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
@@ -254,7 +265,7 @@ struct gpt_params {
     bool fused_mmad        = true;  // fused mul+multi_add op
     bool grouped_expert_routing = false; // if to use grouped expert routing (BailingMoeV2 arch)
     bool rope_cache        = false; // if to use RoPE cache (for supported models)
-    bool graph_reuse       = false; // if to reuse compute graphs
+    bool graph_reuse       = true;  // if to reuse compute graphs
     int  min_experts       = -1;
     float thresh_experts   = 0;
 
@@ -276,6 +287,10 @@ struct gpt_params {
     bool validate_quants   = false; // if true, check for NaNs while loading the model
     bool only_active_exps  = true;  // if true, offload only active experts (relevant only for hybrid CPU/GPU)
     bool merge_qkv         = false; // if true, merge separate Q, K, V tensors into a single, contiguous tensor
+    bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
+    bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling
+    bool split_mode_f16    = true;  // if true, intermediate results will be cast to f16 before copying to other GPUs to perform reduce ops
+    bool scheduler_async   = false; // if true, in split mode graph the scheduler will use multiple threads to evaluate the graph
 
     std::string cache_type_k = "f16"; // KV cache data type for the K
     std::string cache_type_v = "f16"; // KV cache data type for the V
@@ -287,6 +302,8 @@ struct gpt_params {
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
     bool no_mmproj = false;         // explicitly disable multimodal model
     std::vector<std::string> image; // path to image file(s)
+    int image_min_tokens = -1;
+    int image_max_tokens = -1;
 
     // embedding
     bool embedding         = false; // get only sentence embedding
@@ -308,6 +325,7 @@ struct gpt_params {
     std::string system_prompt = "";
     bool enable_chat_template = true;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    thinking_tokens think_tokens;
     int reasoning_budget = -1;
     bool prefill_assistant = true;
 

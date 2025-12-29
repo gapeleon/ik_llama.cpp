@@ -621,6 +621,7 @@ extern "C" {
         GGML_OP_FUSED_UP_GATE,
         GGML_OP_MOE_FUSED_UP_GATE,
         GGML_OP_MUL_MULTI_ADD,
+        GGML_OP_HADAMARD,
 
         GGML_OP_SCALE,
         GGML_OP_SET,
@@ -687,6 +688,10 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
 
         GGML_OP_GLU,
+
+        GGML_OP_REDUCE,
+        GGML_OP_FAKE_CPY,
+        GGML_OP_FUSED_NORM,
 
         GGML_OP_COUNT,
     };
@@ -1092,6 +1097,11 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    GGML_API struct ggml_tensor * ggml_hadamard(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n);
+
     // dst = a
     // view(dst, nb1, nb2, nb3, offset) += b
     // return dst
@@ -1473,6 +1483,18 @@ extern "C" {
             float                 eps);
 
     GGML_API struct ggml_tensor * ggml_fused_rms_norm_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_fused_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_fused_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
@@ -2574,6 +2596,12 @@ extern "C" {
     GGML_API size_t ggml_graph_overhead(void);
     GGML_API size_t ggml_graph_overhead_custom(size_t size, bool grads);
 
+    GGML_API int                   ggml_graph_size(struct ggml_cgraph* cgraph);
+    GGML_API struct ggml_tensor* ggml_graph_node(struct ggml_cgraph* cgraph, int i); // if i < 0, returns nodes[n_nodes + i]
+    GGML_API struct ggml_tensor** ggml_graph_nodes(struct ggml_cgraph* cgraph);
+    GGML_API int                   ggml_graph_n_nodes(struct ggml_cgraph* cgraph);
+
+
     // ggml_graph_plan() has to be called before ggml_graph_compute()
     // when plan.work_size > 0, caller must allocate memory for plan.work_data
     GGML_API struct ggml_cplan ggml_graph_plan   (const struct ggml_cgraph * cgraph, int n_threads /*= GGML_DEFAULT_N_THREADS*/);
@@ -3014,6 +3042,24 @@ extern "C" {
     } ggml_type_traits_t;
 
     GGML_API ggml_type_traits_t ggml_internal_get_type_traits(enum ggml_type type);
+
+    typedef struct {
+        int                   n_device;
+        int                   split_dim;
+        struct ggml_tensor *  tensor;
+        struct ggml_tensor ** splits;
+    } ggml_split_tensor_t;
+
+    GGML_API struct ggml_tensor * ggml_reduce(
+            struct ggml_context         * ctx,
+            struct ggml_tensor         ** a,
+            int                           n,
+            enum ggml_op                  op);
+
+    GGML_API struct ggml_tensor * ggml_fake_cpy(
+            struct ggml_context         * ctx,
+            struct ggml_tensor          * dst,
+            struct ggml_tensor          * src);
 
 #ifdef  __cplusplus
 }

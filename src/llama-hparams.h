@@ -110,7 +110,7 @@ struct llama_hparams {
     uint32_t n_no_rope_layer_step    = 4;
     uint32_t n_attn_temp_floor_scale = 8192;
     float    f_attn_temp_scale       = 0.1;
-	
+
 	// qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
 	
@@ -188,6 +188,16 @@ struct llama_hparams {
         }
 
         GGML_ABORT("fatal error");
+    }
+
+    uint32_t n_embd_inp() const {
+        uint32_t n_embd_inp = n_embd;
+
+        if (n_deepstack_layers > 0) {
+            n_embd_inp += n_embd * n_deepstack_layers;
+        }
+
+        return n_embd_inp;
     }
 
     uint32_t n_ff(uint32_t il = 0) const {

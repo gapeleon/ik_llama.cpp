@@ -253,6 +253,30 @@ common_webui common_webui_from_name(const std::string& format) {
     }
 }
 
+thinking_tokens thinking_tokens_from_string(const std::string& format) {
+    thinking_tokens think_token;
+    std::string token_string = string_strip(format);
+    if (token_string == "none" || token_string == "None") {
+        think_token.exclude = false;
+        return think_token;
+    }
+    else if (token_string == "auto" || token_string == "Auto") {
+        think_token.exclude = true;
+        think_token.begin = "<think>";
+        think_token.end = "</think>";
+        return think_token;
+    }
+    // Use user provided think tokens
+    auto start_end = string_split(format, ",");
+    if (start_end.size() == 2) {
+        think_token.exclude = true;
+        think_token.begin = start_end[0];
+        think_token.end = start_end[1];
+    }
+    return think_token;
+}
+
+
 static std::string read_file(const std::string& fname) {
     std::ifstream file(fname);
     if (!file) {
@@ -270,6 +294,30 @@ static std::string parse_device_list(const std::string& value) {
     return value;
 }
 
+static std::string add_rpc_devices(std::string& servers) {
+    std::string rpc_devices;
+#ifdef GGML_USE_RPC
+    std::vector<std::string> rpc_servers = string_split(servers, ",");
+    if (rpc_servers.empty()) {
+        throw std::invalid_argument("no RPC servers specified");
+    }
+    for (auto& server : rpc_servers) {
+        uint32_t dev_count = ggml_backend_rpc_get_device_count(server.c_str());
+        uint32_t device = 0;
+        for (uint32_t i = 0; i < dev_count; ++i) {
+            const auto buft = ggml_backend_rpc_buffer_type(server.c_str(), device);
+            if (buft != nullptr) {
+                rpc_devices = rpc_devices + server + "|" + std::to_string(device) + ",";
+                ++device;
+            }
+        }
+    }
+    if (!rpc_devices.empty()) {
+        rpc_devices = rpc_devices.substr(0, rpc_devices.size() - 1); // remove trailing comma
+    }
+#endif
+    return rpc_devices;
+}
 
 std::pair<long, std::vector<char>> common_remote_get_content(const std::string& url, const common_remote_params&) {
     if (!url.empty()) {
@@ -733,6 +781,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.defrag_thold = std::stof(argv[i]);
         return true;
     }
+    if (arg == "--max-extra-alloc" || arg == "-mea") {
+        CHECK_ARG
+        params.max_extra_alloc_MiB = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--samplers") {
         CHECK_ARG
         const auto sampler_names = string_split(argv[i], ";");
@@ -1047,9 +1100,19 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.mmproj_use_gpu = false;
         return true;
     }
-    if (arg == "--image") {
+    if (arg == "--image" || arg == "--audio") {
         CHECK_ARG
         params.image.emplace_back(argv[i]);
+        return true;
+    }
+    if (arg == "--image-min-tokens") {
+        CHECK_ARG
+            params.image_min_tokens = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--image-max-tokens") {
+        CHECK_ARG
+            params.image_max_tokens = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-i" || arg == "--interactive") {
@@ -1178,11 +1241,18 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "-rcache" || arg == "--rope-cache") {
-        params.rope_cache = true;
+        fprintf(stderr, "=================================================================================\n");
+        fprintf(stderr, "  -rcache, --rope-cache is no longer supported\n");
+        fprintf(stderr, "=================================================================================\n");
+        //params.rope_cache = true;
         return true;
     }
     if (arg == "-gr" || arg == "--graph-reuse") {
         params.graph_reuse = true;
+        return true;
+    }
+    if (arg == "-no-gr" || arg == "--no-graph-reuse") {
+        params.graph_reuse = false;
         return true;
     }
     if (arg == "-ser" || arg == "--smart-expert-reduction") {
@@ -1230,6 +1300,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
 #endif // GGML_USE_CUDA_SYCL_VULKAN
         return true;
     }
+    else if (arg == "--max-gpu") {
+        CHECK_ARG
+        params.max_gpu = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--split-mode" || arg == "-sm") {
         CHECK_ARG
         std::string arg_next = argv[i];
@@ -1239,12 +1314,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         else if (arg_next == "layer") {
             params.split_mode = LLAMA_SPLIT_MODE_LAYER;
         }
-        else if (arg_next == "row") {
-            fprintf(stderr, "\n\n=====================================================================================\n");
-            fprintf(stderr, " Split mode row is no longer supported\n");
-            fprintf(stderr, "=====================================================================================\n\n\n");
-            GGML_ABORT("fatal error");
-            params.split_mode = LLAMA_SPLIT_MODE_ROW;
+        else if (arg_next == "attn") {
+            params.split_mode = LLAMA_SPLIT_MODE_ATTN;
+        }
+        else if (arg_next == "graph") {
+            params.split_mode = LLAMA_SPLIT_MODE_GRAPH;
         }
         else {
             invalid_param = true;
@@ -1283,15 +1357,12 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--rpc") {
         CHECK_ARG
 #ifdef GGML_USE_RPC
-        params.rpc_servers = argv[i];
-        std::string servers(params.rpc_servers);
-        size_t pos = 0;
-        while ((pos = servers.find(",")) != std::string::npos) {
-            std::string server = servers.substr(0, pos);
-            ggml_backend_rpc_buffer_type(server.c_str());
-            servers.erase(0, pos + 1);
+        std::string servers(argv[i]);
+        servers = add_rpc_devices(servers);
+        if (servers.empty()) {
+            return false;
         }
-        ggml_backend_rpc_buffer_type(servers.c_str());
+        params.rpc_servers = servers;
 #endif
         return true;
     }
@@ -1306,10 +1377,6 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--override-tensor" || arg == "-ot") {
         CHECK_ARG
-            /*for (auto endpoint : params.rpc_servers.split)
-            {
-
-            }*/
         if (!parse_buft_overrides(std::string{ argv[i] }, params.tensor_buft_overrides)) {
             fprintf(stderr, "error: Invalid tensor buffer type override: %s\n", argv[i]);
             invalid_param = true;
@@ -1363,6 +1430,26 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "-mqkv" || arg == "--merge-qkv") {
         params.merge_qkv = true;
+        return true;
+    }
+    if (arg == "-khad" || arg == "--k-cache-hadamard") {
+        params.k_cache_hadamard = true;
+        return true;
+    }
+    if (arg == "-smgs" || arg == "--split-mode-graph-scheduling") {
+        params.split_mode_graph_scheduling = true;
+        return true;
+    }
+    if (arg == "-sas" || arg == "--scheduler-async") {
+        params.scheduler_async = true;
+        return true;
+    }
+    if (arg == "-smf16" || arg == "--split-mode-f16") {
+        params.split_mode_f16 = true;
+        return true;
+    }
+    if (arg == "-smf32" || arg == "--split-mode-f32") {
+        params.split_mode_f16 = false;
         return true;
     }
     if (arg == "--numa") {
@@ -1696,6 +1783,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         if (!params.slot_save_path.empty() && params.slot_save_path[params.slot_save_path.size() - 1] != DIRECTORY_SEPARATOR) {
             params.slot_save_path += DIRECTORY_SEPARATOR;
         }
+        return true;
+    }
+    if (arg == "--reasoning-tokens") {
+        CHECK_ARG
+        params.think_tokens = thinking_tokens_from_string(std::string(argv[i]));
         return true;
     }
     if (arg == "--reasoning-budget") {
@@ -2041,10 +2133,16 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-fug, --no-fused-up-gate",   "disaable fused up-gate (default: %s)", params.fused_up_gate ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-mmad, --no-fused-mul-multiadd", "disable fused mul-multi_add (default: %s)", params.fused_mmad? "enabled" : "disabled" });
-    options.push_back({ "*",           "-rcache, --rope-cache",         "enable RoPE cache (default: %s)", params.rope_cache ? "enabled" : "disabled" });
+    //options.push_back({ "*",           "-rcache, --rope-cache",         "enable RoPE cache (default: %s)", params.rope_cache ? "enabled" : "disabled" });
     options.push_back({ "*",           "-gr, --graph-reuse",            "enable graph reuse (default: %s)", params.graph_reuse ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-no-gr, --no-graph-reuse",      "disable graph reuse (default: %s)", !params.graph_reuse ? "enabled" : "disabled" });
     options.push_back({ "*",         "-ser,  --smart-expert-reduction", "experts reduction (default: %d,%g)", params.min_experts, params.thresh_experts});
     options.push_back({ "*",         "-mqkv,  --merge-qkv,",            "merge Q,K,V (default: %d)", params.merge_qkv});
+    options.push_back({ "*",         "-khad,  --k-cache-hadamard,",     "Use Hadamard transform for K-cache (default: %d)", params.k_cache_hadamard});
+    options.push_back({ "*",         "-smf16, --split-mode-f16,",       "Use f16 for data exchange between GPUs (default: %d)", params.split_mode_f16});
+    options.push_back({ "*",         "-smf32, --split-mode-f32,",       "Use f32 for data exchange between GPUs (default: %d)", !params.split_mode_f16});
+    options.push_back({ "*",         "-smgs, --split-mode-graph-scheduling,", "Force Split Mode Graph Scheduling (default: %d)", params.split_mode_graph_scheduling});
+    options.push_back({ "*",         "-sas,  ==scheduler_async,",       "Async evaluation of compute graphs: %d)", params.scheduler_async});
     options.push_back({ "*",         "-vq, --validate-quants",          "validate quantized data while loading the model (default: %d)", params.validate_quants});
     options.push_back({ "*",           "-p,    --prompt PROMPT",        "prompt to start generation with\n"
                                                                         "in conversation mode, this will be used as system prompt\n"
@@ -2111,6 +2209,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "main",        "       --cfg-negative-prompt-file FNAME",
                                                                         "negative prompt file to use for guidance" });
     options.push_back({ "main",        "       --cfg-scale N",          "strength of guidance (default: %.1f, 1.0 = disable)", (double)sparams.cfg_scale });
+    options.push_back({ "template" });
     options.push_back({ "main",        "       --jinja",
                                                                         "set custom jinja chat template (default: template taken from model's metadata)\n"
                                                                         "if suffix/prefix are specified, template will be disabled\n"
@@ -2127,7 +2226,15 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                         "- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`\n"
                         "(default: none)", });
     options.push_back({ "main",      "       --chat-template-kwargs JSON",  "sets additional params for the json template parser"});
-    options.push_back({ "main",      "       --reasoning-budget N",  "controls the amount of thinking allowed; currently only one of: -1 for unrestricted thinking budget, or 0 to disable thinking (default: -1)" });
+    options.push_back({ "main",      "       --reasoning-budget N",  "controls the amount of thinking allowed.\n"
+                                                                                                     "currently only one of: -1 for unrestricted thinking budget, or 0 to disable thinking"
+                                                                                                      "(default: -1)" });
+    options.push_back({ "main",      "       --reasoning-tokens FORMAT",     "exclude reasoning tokens to select the slot more accurately.\n"
+						                                                                                            "none: include all tokens\n"
+                                                                                                                    "auto: exclude all tokens between <think> and </think>\n"
+						                                                                                            "Or comma separated start and end tokens such as [THINK],[/THINK]\n"
+						                                                                                            "(default: auto)" });
+
     options.push_back({ "main",      "       --no-prefill-assistant",  "whether to prefill the assistant's response if the last message is an assistant message (default: prefill enabled)\n"
             "when this flag is set, if the last message is an assistant message then it will be treated as a full message and not prefilled\n" });
     options.push_back({ "grammar" });
@@ -2179,6 +2286,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
 
     options.push_back({ "parallel" });
     options.push_back({ "*",           "-dt,   --defrag-thold N",       "KV cache defragmentation threshold (default: %.1f, < 0 - disabled)", (double)params.defrag_thold });
+    options.push_back({ "*",           "-mea,  --max-extra-alloc",      "Max extra VRAM allocation per GPU (default: %d)", params.max_extra_alloc_MiB});
     options.push_back({ "*",           "-np,   --parallel N",           "number of parallel sequences to decode (default: %d)", params.n_parallel });
     options.push_back({ "*",           "-ns,   --sequences N",          "number of sequences to decode (default: %d)", params.n_sequences });
     options.push_back({ "*",           "-cb,   --cont-batching",        "enable continuous batching (a.k.a dynamic batching) (default: %s)", params.cont_batching ? "enabled" : "disabled" });
@@ -2187,6 +2295,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "multi-modality" });
     options.push_back({ "*",           "       --mmproj FILE",          "path to a multimodal projector file for LLaVA. see examples/llava/README.md" });
     options.push_back({ "*",           "       --image FILE",           "path to an image file. use with multimodal models. Specify multiple times for batching" });
+    options.push_back({ "*",           "       --image-min-tokens N",           "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)"});
+    options.push_back({ "*",           "       --image-max-tokens N",           "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)" });
     options.push_back({ "*",           "       --no-context-shift",           "disable context-shift." });
     options.push_back({ "*",           "--context-shift (auto|on|off|0|1)", "set context-shift (default: %s)", params.ctx_shift ? "on" : "off" });
     options.push_back({ "backend" });
@@ -2217,6 +2327,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
         options.push_back({ "*",           "-sm,   --split-mode SPLIT_MODE",
                                                                         "how to split the model across multiple GPUs, one of:\n"
                                                                         "  - none: use one GPU only\n"
+                                                                        "  - graph: split model tensors and computation graph across GPUs\n"
                                                                         "  - layer (default): split layers and KV across GPUs\n" });
         options.push_back({ "*",           "-ts,   --tensor-split SPLIT",
                                                                         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1" });
@@ -2228,6 +2339,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                          "Example: CUDA0,CUDA1,RPC[192.168.0.1:8080]\n" });
         options.push_back({ "*",           "-mg,   --main-gpu i",       "the GPU to use for the model (with split-mode = none),\n"
                                                                         "or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu });
+        options.push_back({ "*",           "--max-gpu i",               "max. number of GPUs to use at a time with split mode 'graph', (default: %d)", params.max_gpu });
     }
 
     options.push_back({ "model" });
@@ -2616,7 +2728,19 @@ bool fs_validate_filename(const std::string & filename) {
 
     std::u32string filename_utf32;
     try {
+#if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#    pragma GCC diagnostic push
+#    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
         std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> converter;
+#if defined(__clang__)
+#    pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#    pragma GCC diagnostic pop
+#endif
         filename_utf32 = converter.from_bytes(filename);
 
         // If the reverse conversion mismatches, it means overlong UTF-8 sequences were used,
@@ -2671,11 +2795,29 @@ bool fs_validate_filename(const std::string & filename) {
     return true;
 }
 
+#ifdef _WIN32
+static std::wstring utf8_to_wstring(const std::string& str) {
+    if (str.empty()) {
+        return std::wstring();
+    }
+
+    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0);
+
+    if (size <= 0) {
+        return std::wstring();
+    }
+
+    std::wstring wstr(size, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstr[0], size);
+
+    return wstr;
+}
+#endif
+
 // returns true if successful, false otherwise
 bool fs_create_directory_with_parents(const std::string & path) {
 #ifdef _WIN32
-    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-    std::wstring wpath = converter.from_bytes(path);
+    std::wstring wpath = utf8_to_wstring(path);
 
     // if the path already exists, check whether it's a directory
     const DWORD attributes = GetFileAttributesW(wpath.c_str());
@@ -2924,6 +3066,7 @@ struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & 
     mparams.mla             = params.mla_attn;
     mparams.rpc_servers     = params.rpc_servers.c_str();
     mparams.main_gpu        = params.main_gpu;
+    mparams.max_gpu         = params.max_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
@@ -2989,11 +3132,20 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
 
 struct llama_context_params llama_context_params_from_gpt_params(const gpt_params & params) {
     auto cparams = llama_context_default_params();
+    int n_batch = params.n_batch;
+    int n_ubatch = params.n_ubatch;
+
+    // temporary fix for qwen mtmd
+    if (!params.mmproj.path.empty()) {
+        n_batch = std::max(params.n_batch, params.n_ubatch);
+        n_ubatch = params.n_batch;
+        fprintf(stdout, "Adjust batch size for mtmd: u_batch = %d, batch = %d\n", n_ubatch, n_batch);
+    }
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_batch           = params.n_batch;
-    cparams.n_ubatch          = params.n_ubatch;
+    cparams.n_batch           = n_batch;
+    cparams.n_ubatch          = n_ubatch;
     cparams.n_threads         = params.n_threads;
     cparams.n_threads_batch   = params.n_threads_batch == -1 ? params.n_threads : params.n_threads_batch;
     cparams.seed              = params.seed;
@@ -3022,9 +3174,14 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     cparams.fused_mmad        = params.fused_mmad;
     cparams.rope_cache        = params.rope_cache;
     cparams.graph_reuse       = params.graph_reuse;
+    cparams.k_cache_hadamard  = params.k_cache_hadamard;
+    cparams.split_mode_graph_scheduling = params.split_mode_graph_scheduling;
+    cparams.split_mode_f16    = params.split_mode_f16;
+    cparams.scheduler_async   = params.scheduler_async;
     cparams.min_experts       = params.min_experts;
     cparams.thresh_experts    = params.thresh_experts;
     cparams.only_active_experts = params.only_active_exps;
+    cparams.max_extra_alloc   = params.max_extra_alloc_MiB;
 
     cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
     cparams.type_v = kv_cache_type_from_str(params.cache_type_v);
@@ -3519,175 +3676,6 @@ bool llama_should_add_bos_token(const llama_model * model) {
     return add_bos != -1 ? bool(add_bos) : (llama_vocab_type(model) == LLAMA_VOCAB_TYPE_SPM);
 }
 
-//
-// Chat template utils
-//
-//
-//bool llama_chat_verify_template(const struct llama_model* model, const std::string& tmpl, bool use_jinja) {
-//    if (use_jinja) {
-//        try {
-//            auto chat_template = common_chat_template(tmpl, "<s>", "</s>");
-//            common_chat_inputs inputs;
-//            inputs.messages = json::array({ {
-//                {"role", "user"},
-//                {"content", "test"},
-//            } });
-//            common_chat_params_init(chat_template, inputs);
-//            return true;
-//        }
-//        catch (const std::exception& e) {
-//            fprintf(stdout,"%s: failed to apply template: %s\n", __func__, e.what());
-//            return false;
-//        }
-//    }
-//    llama_chat_message chat[] = { {"user", "test"} };
-//    const int res = llama_chat_apply_template(model, tmpl.c_str(), chat, 1, true, nullptr, 0);
-//    return res >= 0;
-//}
-
-//std::string llama_chat_apply_template(const struct llama_model * model,
-//    const common_chat_template& tmpl,
-//    const std::vector<common_chat_msg> & msgs,
-//    bool add_ass,
-//    bool use_jinja) {
-//    if (use_jinja) {
-//        auto messages = json::array();
-//        for (const auto& msg : msgs) {
-//            messages.push_back({ {"role", msg.role}, {"content", msg.content} });
-//        }
-//        common_chat_inputs inputs;
-//        inputs.messages = messages;
-//        inputs.add_generation_prompt = add_ass;
-//        return common_chat_params_init(tmpl, inputs).prompt;
-//    }
-//    int alloc_size = 0;
-//    std::vector<llama_chat_message> chat;
-//    for (auto & msg : msgs) {
-//        chat.push_back({msg.role.c_str(), msg.content.c_str()});
-//        alloc_size += (msg.role.size() + msg.content.size()) * 1.25;
-//    }
-//
-//    std::vector<char> buf(alloc_size);
-//
-//    // run the first time to get the total output length
-//    int32_t res = llama_chat_apply_template(model, tmpl.source().c_str(), chat.data(), chat.size(), add_ass, buf.data(), buf.size());
-//    // error: chat template is not supported
-//    if (res < 0) {
-//        // if the custom "tmpl" is not supported, we throw an error
-//        // this is a bit redundant (for good), since we're not sure if user validated the custom template with llama_chat_verify_template()
-//        throw std::runtime_error("this custom template is not supported");
-//    }
-//
-//    // if it turns out that our buffer is too small, we resize it
-//    if ((size_t)res > buf.size()) {
-//        buf.resize(res);
-//        res = llama_chat_apply_template(model, tmpl.source().c_str(), chat.data(), chat.size(), add_ass, buf.data(), buf.size());
-//    }
-//
-//    std::string formatted_chat(buf.data(), res);
-//    return formatted_chat;
-//}
-////
-//std::string llama_chat_format_single(const struct llama_model * model,
-//    const common_chat_template& tmpl,
-//    const std::vector<common_chat_msg> & past_msg,
-//        const common_chat_msg & new_msg,
-//    bool add_ass,
-//    bool use_jinja) {
-//    std::ostringstream ss;
-//    auto fmt_past_msg = past_msg.empty() ? "" : llama_chat_apply_template(model, tmpl, past_msg, false, use_jinja);
-//    std::vector<common_chat_msg> chat_new(past_msg);
-//    // if the past_msg ends with a newline, we must preserve it in the formatted version
-//    if (add_ass && !fmt_past_msg.empty() && fmt_past_msg.back() == '\n') {
-//        ss << "\n";
-//    };
-//    // format chat with new_msg
-//    chat_new.push_back(new_msg);
-//    auto fmt_new_msg = llama_chat_apply_template(model, tmpl, chat_new, add_ass, use_jinja);
-//    // get the diff part
-//    ss << fmt_new_msg.substr(fmt_past_msg.size(), fmt_new_msg.size() - fmt_past_msg.size());
-//    return ss.str();
-//}
-
-//std::string llama_chat_format_example(const struct llama_model * model, const common_chat_template& tmpl, bool use_jinja) {
-//    std::vector<common_chat_msg> msgs = {
-//        {"system",    "You are a helpful assistant", {}},
-//        {"user",      "Hello", {}},
-//        {"assistant", "Hi there", {}},
-//        {"user",      "How are you?", {}},
-//    };
-//    return llama_chat_apply_template(model, tmpl, msgs, true, use_jinja);
-//}
-//
-//#define CHATML_TEMPLATE_SRC \
-//    "{%- for message in messages -%}\n" \
-//    "  {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' -}}\n" \
-//    "{%- endfor -%}\n" \
-//    "{%- if add_generation_prompt -%}\n" \
-//    "  {{- '<|im_start|>assistant\n' -}}\n" \
-//    "{%- endif -%}"
-//
-//common_chat_templates llama_chat_templates_from_model(const struct llama_model* model, const std::string& chat_template_override)
-//{
-//    std::string default_template_src;
-//    std::string template_tool_use_src;
-//    bool has_explicit_template = !chat_template_override.empty();
-//    if (chat_template_override.empty()) {
-//        auto str = llama_model_chat_template(model, /* name */ nullptr);
-//        if (str) {
-//            default_template_src = str;
-//            has_explicit_template = true;
-//        }
-//        str = llama_model_chat_template(model, /* name */ "tool_use");
-//        if (str) {
-//            template_tool_use_src = str;
-//            has_explicit_template = true;
-//        }
-//    }
-//    else {
-//        default_template_src = chat_template_override;
-//    }
-//    if (default_template_src.empty() || default_template_src == "chatml") {
-//        if (!template_tool_use_src.empty()) {
-//            default_template_src = template_tool_use_src;
-//        }
-//        else {
-//            default_template_src = CHATML_TEMPLATE_SRC;
-//        }
-//    }
-//    auto vocab = llama_model_get_vocab(model);
-//    const auto get_token = [&](llama_token token, const char* name, const char* jinja_variable_name) {
-//        if (token == LLAMA_TOKEN_NULL) {
-//            if (default_template_src.find(jinja_variable_name) != std::string::npos
-//                || template_tool_use_src.find(jinja_variable_name) != std::string::npos) {
-//                fprintf(stdout, "%s: warning: vocab does not have a %s token, jinja template won't work as intended.\n", __func__, name);
-//            }
-//            return std::string();
-//        }
-//        else {
-//            return llama_token_to_piece(model, token, true);
-//        }
-//    };
-//    auto token_bos = get_token(llama_token_bos_impl(*vocab), "BOS", "bos_token");
-//    auto token_eos = get_token(llama_token_eos_impl(*vocab), "EOS", "eos_token");
-//    try {
-//        return {
-//            has_explicit_template,
-//            std::make_unique<minja::chat_template>(default_template_src, token_bos, token_eos),
-//            template_tool_use_src.empty()
-//                ? nullptr
-//                : std::make_unique<minja::chat_template>(template_tool_use_src, token_bos, token_eos),
-//        };
-//    }
-//    catch (const std::exception& e) {
-//        LOG("%s: failed to parse chat template: %s\n", __func__, e.what());
-//        return {
-//            has_explicit_template,
-//            std::make_unique<minja::chat_template>(CHATML_TEMPLATE_SRC, token_bos, token_eos),
-//            nullptr,
-//        };
-//    }
-//}
 
 //
 // KV cache utils
@@ -4113,6 +4101,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     }
     fprintf(stream, "lora_init_without_apply: %s # default: false\n", params.lora_init_without_apply ? "true" : "false");
     fprintf(stream, "main_gpu: %d # default: 0\n", params.main_gpu);
+    fprintf(stream, "max_gpu: %d # default: 0\n", params.max_gpu);
     fprintf(stream, "min_keep: %d # default: 0 (disabled)\n", sparams.min_keep);
     fprintf(stream, "mirostat: %d # default: 0 (disabled)\n", sparams.mirostat);
     fprintf(stream, "mirostat_ent: %f # default: 5.0\n", sparams.mirostat_tau);
@@ -4132,6 +4121,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "use_thp: %s # default: false\n", params.use_thp ? "true" : "false");
     fprintf(stream, "validate_quants: %s # default: false\n", params.validate_quants ? "true" : "false");
     fprintf(stream, "merge_qkv: %s # default: false\n", params.merge_qkv ? "true" : "false");
+    fprintf(stream, "max_extra_alloc: %d # default: 256\n", params.max_extra_alloc_MiB);
     fprintf(stream, "penalize_nl: %s # default: false\n", sparams.penalize_nl ? "true" : "false");
     fprintf(stream, "ppl_output_type: %d # default: 0\n", params.ppl_output_type);
     fprintf(stream, "ppl_stride: %d # default: 0\n", params.ppl_stride);
@@ -4168,6 +4158,10 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "fused_mmad: %s # default: true\n", params.fused_mmad ? "true" : "false");
     fprintf(stream, "rope_cache: %s # default: false\n", params.rope_cache ? "true" : "false");
     fprintf(stream, "graph_reuse: %s # default: false\n", params.graph_reuse ? "true" : "false");
+    fprintf(stream, "k_cache_hadamard: %s # default: false\n", params.k_cache_hadamard ? "true" : "false");
+    fprintf(stream, "split_mode_graph_scheduling: %s # default: false\n", params.split_mode_graph_scheduling ? "true" : "false");
+    fprintf(stream, "split_mode_f16: %s # default: true\n", params.split_mode_f16 ? "true" : "false");
+    fprintf(stream, "scheduler_async: %s # default: false\n", params.scheduler_async ? "true" : "false");
     fprintf(stream, "ser: %d,%g # defaulr: -1,0\n", params.min_experts, params.thresh_experts);
     fprintf(stream, "temp: %f # default: 0.8\n", sparams.temp);
 

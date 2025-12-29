@@ -39,6 +39,10 @@ struct llama_cparams {
     bool fused_mmad;
     bool rope_cache;
     bool graph_reuse;
+    bool k_cache_hadamard;
+    bool split_mode_graph_scheduling;
+    bool split_mode_f16;
+    bool scheduler_async;
     int  min_experts;
     float thresh_experts;
 

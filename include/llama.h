@@ -266,10 +266,17 @@ extern "C" {
         LLAMA_ATTENTION_TYPE_NON_CAUSAL  = 1,
     };
 
+    enum llama_flash_attn_type {
+        LLAMA_FLASH_ATTN_TYPE_AUTO = -1,
+        LLAMA_FLASH_ATTN_TYPE_DISABLED = 0,
+        LLAMA_FLASH_ATTN_TYPE_ENABLED = 1,
+    };
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE    = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER   = 1, // split layers and KV across GPUs
-        LLAMA_SPLIT_MODE_ROW     = 2, // split rows across GPUs
+        LLAMA_SPLIT_MODE_ATTN    = 2, // splits self-attention computations across GPUs
+        LLAMA_SPLIT_MODE_GRAPH   = 3, // splits computations across GPUs
     };
 
 
@@ -355,6 +362,7 @@ extern "C" {
         // LLAMA_SPLIT_ROW: the GPU that is used for small tensors and intermediate results
         // LLAMA_SPLIT_LAYER: ignored
         int32_t main_gpu;
+        int32_t max_gpu;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
@@ -396,6 +404,7 @@ extern "C" {
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_threads;         // number of threads to use for generation
         uint32_t n_threads_batch;   // number of threads to use for batch processing
+        int32_t  max_extra_alloc;   // Max. additional VRAM the scheduler is allowed to allocate
 
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
@@ -433,6 +442,10 @@ extern "C" {
         int  min_experts;
         float thresh_experts;
         bool only_active_experts;
+        bool k_cache_hadamard;  // if true, apply Hadamard transfrom to K-cache
+        bool split_mode_graph_scheduling; // if true, force split mode graph scheduling
+        bool split_mode_f16;    // if true, cast intermediate results to f16 before copying to other GPUs
+        bool scheduler_async;   // if true, with split mode "graph" graph evaluation will be done using multiple threads
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -589,6 +602,8 @@ extern "C" {
     LLAMA_API const struct llama_vocab* llama_get_model_vocab(const struct llama_model* model);
     LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model);
     LLAMA_API int32_t llama_n_embd     (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd_inp(const struct llama_model* model);
+    
     LLAMA_API int32_t llama_n_layer    (const struct llama_model * model);
 
     // Compat
@@ -1305,12 +1320,16 @@ extern "C" {
 
 LLAMA_API void                   llama_sampler_reset(struct llama_sampler* smpl);
 
+/// @details Intializes a GBNF grammar, see grammars/README.md for details.
+/// @param vocab The vocabulary that this grammar will be used with.
+/// @param grammar_str The production rules for the grammar, encoded as a string. Returns an empty grammar if empty. Returns NULL if parsing of grammar_str fails.
+/// @param grammar_root The name of the start symbol for the grammar.
 LLAMA_API struct llama_grammar* llama_sampler_init_grammar(
     const struct llama_vocab* vocab,
     const char* grammar_str,
-
         const char* grammar_root);
-    /// @details Lazy grammar sampler, introduced in https://github.com/ggerganov/llama.cpp/pull/9639
+
+/// @details Lazy grammar sampler, introduced in https://github.com/ggerganov/llama.cpp/pull/9639
 /// @param trigger_words A list of words that will trigger the grammar sampler. This may be updated to a loose regex syntax (w/ ^) in a near future.
 /// @param trigger_tokens A list of tokens that will trigger the grammar sampler.
 DEPRECATED(LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy(
@@ -1465,11 +1484,7 @@ using llama_grammar_candidates = std::vector<llama_grammar_candidate>;
 const llama_grammar_rules  & llama_grammar_get_rules (const struct llama_grammar * grammar);
       llama_grammar_stacks & llama_grammar_get_stacks(      struct llama_grammar * grammar);
 
-void llama_grammar_accept(
-        const llama_grammar_rules  & rules,
-        const llama_grammar_stacks & stacks,
-        const uint32_t chr,
-              llama_grammar_stacks & new_stacks);
+void llama_grammar_accept(struct llama_grammar* grammar, uint32_t chr);
 
 std::vector<llama_grammar_candidate> llama_grammar_reject_candidates_for_stack(
         const llama_grammar_rules & rules,
