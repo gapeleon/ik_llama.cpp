@@ -179,7 +179,7 @@ export function filterThoughtFromMsgs(messages: APIMessage[]) {
       content:
         msg.role === 'assistant'
           ? contentStr
-              .split(/<\/think>|<\|end\|>/)
+              .split(/<\/think>|<\|end\|>|<channel\|>/)
               .at(-1)!
               .trim()
           : contentStr,
